@@ -1,0 +1,65 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and local environment variables
+.venv/
+venv/
+env/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Packaging/build artifacts
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Training outputs, logs, and experiment trackers
+outputs/
+runs/
+logs/
+wandb/
+tensorboard/
+*.log
+
+# Learned model/replay checkpoints. The return-energy NPZ is intentionally
+# not ignored because a fresh server clone needs it to run the environment.
+checkpoints/**/*.pt
+checkpoints/**/*.pth
+checkpoints/**/*.ckpt
+checkpoints/**/*replay*
+checkpoints/**/*buffer*
+
+# Temporary evaluation/render files outside outputs/
+*.tmp
+*.temp
+*.bak
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local test/tool caches
+.cache/
+.matplotlib/
+
