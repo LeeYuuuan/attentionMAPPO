@@ -1,0 +1,80 @@
+seed: 43
+
+training:
+  num_episodes: 4000
+  rollout_steps: 100
+  mappo_warmup_upper_steps: 0
+  sac_update_start_size: 5000
+  sac_update_every_low_steps: 1
+  sac_updates_per_low_step: 1
+  replay_balanced_fraction: 0.5
+  report_interval_episodes: 50
+  eval_episodes: 1
+  checkpoint_interval_upper_steps: 20480
+  pretrained_sac_path: null
+  output_dir: outputs/joint_attention_mappo_v4
+
+joint:
+  episode_len_steps: 100
+  timestep_min: 10.0
+  block_steps: 10
+  max_slots: 2
+  max_wait: 2
+  end_if_any_dead: true
+  serving_weight: 3.0
+  waiting_weight: 1.0
+  buffer_weight: 1.0
+  death_penalty: 10.0
+  buf_ref: 800.0
+  low_random_steps: 5000
+  low_random_seed: 1043
+
+energy:
+  P_hover: 326.0
+  P_horiz: 257.0
+  v_horiz: 10.0
+  battery_capacity_Wh: 125.0
+  airship_pos: [200.0, 200.0]
+  airship_alt: 50.0
+  uav_alt: 0.0
+  P_climb: null
+  return_table_path: checkpoints/energy_tables/return_energy_table.npz
+
+mappo:
+  gamma: 0.99
+  gae_lambda: 0.95
+  actor_lr: 0.0001
+  critic_lr: 0.0001
+  clip_range: 0.20
+  value_clip_range: 0.20
+  entropy_start: 0.001
+  entropy_end: 0.001
+  epochs: 10
+  actor_minibatch_size: 2048
+  critic_minibatch_size: 2048
+  max_grad_norm_actor: 0.5
+  max_grad_norm_critic: 2.0
+  value_coef: 0.5
+  target_kl: null
+  hidden_dim: 512
+  value_normalization: false
+  value_clipping: false
+
+sac:
+  gamma: 0.99
+  tau: 0.005
+  auto_alpha: false
+  init_alpha: 0.2
+  reward_scale: 0.01
+  max_grad_norm: 1.0
+  actor_lr: 0.0001
+  critic_lr: 0.0001
+  alpha_lr: 0.00003
+  batch_size: 64
+  buffer_capacity: 200000
+
+model:
+  hidden_dim: 128
+  n_heads: 4
+  n_layers: 2
+  action_dim: 2
