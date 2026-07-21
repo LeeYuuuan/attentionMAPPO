@@ -148,6 +148,18 @@ def test_return_table_keeps_vertical_energy_at_zero_radius():
     np.testing.assert_allclose(energy, model.frac[0], rtol=1e-6)
 
 
+def test_block_energy_uses_ten_second_move_and_fifty_second_hover():
+    model = EnergyModel(EnergyModelConfig())
+    moving = np.stack([np.arange(11), np.zeros(11)], axis=1).astype(np.float32)
+    hovering = np.zeros((11, 2), np.float32)
+    e_move = model.block_energy_frac(moving, move_sec=10.0, collect_sec=50.0)
+    e_hover = model.block_energy_frac(hovering, move_sec=10.0, collect_sec=50.0)
+    expected_move = 10.0 * (257.0 * 10.0 + 326.0 * 50.0) / 3600.0 / 125.0
+    expected_hover = 10.0 * 326.0 * 60.0 / 3600.0 / 125.0
+    np.testing.assert_allclose(e_move, expected_move, rtol=1e-7)
+    np.testing.assert_allclose(e_hover, expected_hover, rtol=1e-7)
+
+
 def test_rollout_records_dead_agent_mask():
     r = EpisodeRollout()
     r.add(

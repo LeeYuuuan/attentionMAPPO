@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -61,15 +61,20 @@ class EnergyModel:
             ):
                 raise ValueError("invalid dist/frac arrays in return-energy table")
 
-    def block_energy_frac(self, traj_xy: np.ndarray, dt_min: float, block_steps: int) -> float:
+    def block_energy_frac(
+        self, traj_xy: np.ndarray, move_sec: float, collect_sec: float,
+    ) -> float:
         traj = np.asarray(traj_xy, np.float32)
         if len(traj) < 2:
             return 0.0
-        dt_h = (float(dt_min) / 60.0) / float(block_steps)
         energy = 0.0
         for t in range(1, len(traj)):
             moving = np.linalg.norm(traj[t] - traj[t - 1]) > 1e-6
-            energy += (self.cfg.P_horiz if moving else self.cfg.P_hover) * dt_h
+            move_power = self.cfg.P_horiz if moving else self.cfg.P_hover
+            energy += move_power * (float(move_sec) / 3600.0)
+            # Collection occupies the remaining part of every low step, during
+            # which a serving UAV must hover even if it moved beforehand.
+            energy += self.cfg.P_hover * (float(collect_sec) / 3600.0)
         return float(energy / self.cfg.battery_capacity_Wh)
 
     def outbound_energy_frac(self, start_pos_xy: np.ndarray) -> float:
@@ -134,6 +139,14 @@ class AttentionChargingEnv:
             raise ValueError("joint.block_steps must equal time.low_steps_per_high")
         if cfg.episode_len_steps != low_env.high_steps:
             raise ValueError("joint.episode_len_steps must equal time.high_steps")
+        block_minutes = (
+            cfg.block_steps * (low_env.move_sec + low_env.collect_sec) / 60.0
+        )
+        if not np.isclose(cfg.timestep_min, block_minutes):
+            raise ValueError(
+                "joint.timestep_min must equal block_steps * "
+                "(move_sec + collect_sec) / 60"
+            )
         self.buf_clip = 3.0 * cfg.buf_ref
         self.t = 0
         self.uavs: list[ChargingUAV] = []
@@ -141,8 +154,10 @@ class AttentionChargingEnv:
         self.history: dict[str, list] = {}
         self.mission_pos_bank = np.zeros((self.n_uav, 2), np.float32)
         self.return_energy_due = np.zeros(self.n_uav, np.float32)
+        self.last_return_energy_paid = np.zeros(self.n_uav, np.float32)
         self.last_buf_metric = 0.0
         self.low_action_steps = 0
+        self.low_replay_steps = 0
         self.low_action_rng = np.random.default_rng(cfg.low_random_seed)
 
     def _free_slots(self) -> int:
@@ -168,6 +183,7 @@ class AttentionChargingEnv:
         air = self.low_env.world.airship_pos.astype(np.float32)
         self.mission_pos_bank[:] = air[None, :]
         self.return_energy_due[:] = 0.0
+        self.last_return_energy_paid[:] = 0.0
         self.last_buf_metric = float(self.low_env.world.user_pkts.max()) if self.low_env.num_users else 0.0
         self._sync_world_state(prev_status=status)
         self.history = {
@@ -179,6 +195,8 @@ class AttentionChargingEnv:
             "low_max_before": [], "low_max_after": [], "low_team_max_sum": [],
             "low_covered_count": [], "low_oob_count": [], "low_serving_count": [],
             "low_per_uav_collected_sum": [], "low_per_uav_collected_max": [],
+            "energy_block": [], "energy_outbound": [], "energy_return": [],
+            "energy_charge_added": [],
         }
         return self.get_obs_all()
 
@@ -277,9 +295,12 @@ class AttentionChargingEnv:
                 self.wait_queue.append(i)
 
         # Preserve the original rule: return energy is paid on entry to CHARGING.
+        self.last_return_energy_paid[:] = 0.0
         for i, (u, old) in enumerate(zip(self.uavs, prev_status)):
             if old != CHARGING and u.status == CHARGING:
-                u.battery -= float(self.return_energy_due[i])
+                paid = float(self.return_energy_due[i])
+                self.last_return_energy_paid[i] = paid
+                u.battery -= paid
                 self.return_energy_due[i] = 0.0
                 if u.battery <= 0.0:
                     u.battery, u.status = 0.0, DEAD
@@ -287,7 +308,8 @@ class AttentionChargingEnv:
         return prev_status
 
     def _run_low_block(
-        self, *, deterministic: bool, collect_replay: bool
+        self, *, deterministic: bool, collect_replay: bool,
+        low_update_hook: Callable[[], None] | None = None,
     ) -> tuple[float, float, dict[int, np.ndarray]]:
         serving = self.low_env.world.serving_ids()
         tracks = {int(i): [self.low_env.world.uav_pos[i].copy()] for i in serving}
@@ -298,7 +320,7 @@ class AttentionChargingEnv:
             obs = self.low_env._build_obs()
             if serving.size:
                 use_safe_random = (
-                    collect_replay and self.low_action_steps < self.cfg.low_random_steps
+                    collect_replay and self.low_replay_steps < self.cfg.low_random_steps
                 )
                 if use_safe_random:
                     active_actions = self._safe_random_active_actions(obs)
@@ -318,6 +340,11 @@ class AttentionChargingEnv:
             boundary = k == self.cfg.block_steps - 1
             if collect_replay and self.replay is not None and serving.size:
                 self.replay.add(obs, active_actions, reward, next_obs, done=boundary or env_done)
+                self.low_replay_steps += 1
+                # The standalone attention-SAC trained online: one replay add,
+                # then one update before selecting the next low-level action.
+                if low_update_hook is not None:
+                    low_update_hook()
             total_reward += float(reward)
             max_after.append(float(info["max_after"]))
             self.history["low_max_before"].append(float(info["max_before"]))
@@ -368,7 +395,8 @@ class AttentionChargingEnv:
 
     def step(
         self, actions: np.ndarray, *, deterministic_low: bool = False,
-        collect_low_replay: bool = True
+        collect_low_replay: bool = True,
+        low_update_hook: Callable[[], None] | None = None,
     ) -> tuple[dict[str, np.ndarray], float, bool, dict[str, Any]]:
         status_at_step_start = self._status().copy()
         prev_status = self._status().copy()
@@ -384,7 +412,8 @@ class AttentionChargingEnv:
                 outbound[i] = self.energy_model.outbound_energy_frac(self.mission_pos_bank[i])
 
         low_reward, buf_metric, tracks = self._run_low_block(
-            deterministic=deterministic_low, collect_replay=collect_low_replay
+            deterministic=deterministic_low, collect_replay=collect_low_replay,
+            low_update_hook=low_update_hook,
         )
         self.history["trajectory_blocks"].append(
             {int(i): np.asarray(traj, np.float32).copy() for i, traj in tracks.items()}
@@ -393,7 +422,7 @@ class AttentionChargingEnv:
         for i, traj in tracks.items():
             self.mission_pos_bank[i] = traj[-1]
             block_energy[i] = self.energy_model.block_energy_frac(
-                traj, self.cfg.timestep_min, self.cfg.block_steps
+                traj, self.low_env.move_sec, self.low_env.collect_sec
             )
             self.return_energy_due[i] = self.energy_model.return_energy_frac(traj[-1])
 
@@ -407,13 +436,16 @@ class AttentionChargingEnv:
 
         n_chg = sum(u.status == CHARGING for u in self.uavs)
         p_chg = 600.0 if n_chg == 1 else (500.0 if n_chg >= 2 else 0.0)
+        charge_added = np.zeros(self.n_uav, np.float32)
         if p_chg:
             delta = (p_chg * (self.cfg.timestep_min / 60.0)) / self.energy_model.cfg.battery_capacity_Wh
-            for u in self.uavs:
+            for i, u in enumerate(self.uavs):
                 if u.status == CHARGING:
+                    before = u.battery
                     u.battery += delta
                     if u.battery >= 1.0:
                         u.battery, u.full_pending = 1.0, True
+                    charge_added[i] = max(0.0, u.battery - before)
 
         self._sync_world_state(prev_status=self._status())
         self.t += 1
@@ -440,6 +472,10 @@ class AttentionChargingEnv:
         self.history["reward_waiting"].append(waiting_term)
         self.history["reward_buffer"].append(buffer_term)
         self.history["reward_death"].append(death_term)
+        self.history["energy_block"].append(block_energy.copy())
+        self.history["energy_outbound"].append(outbound.copy())
+        self.history["energy_return"].append(self.last_return_energy_paid.copy())
+        self.history["energy_charge_added"].append(charge_added.copy())
         return self.get_obs_all(), reward, bool(done), {
             "buf_metric": buf_metric, "low_reward": low_reward,
             "newly_dead_count": newly_dead_count,

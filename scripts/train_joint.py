@@ -138,6 +138,11 @@ def collect_episode(
     )
     final_status = np.asarray(env.history["status"])[-1]
     path_length = float(serving_path_lengths(env).sum())
+    energy_used = sum(
+        np.asarray(env.history[key], np.float32).sum()
+        for key in ("energy_block", "energy_outbound", "energy_return")
+    )
+    energy_charged = np.asarray(env.history["energy_charge_added"], np.float32).sum()
     return finished, {
         "return": float(total_reward),
         "buf": float(np.mean(env.history["buf_metric"])),
@@ -153,6 +158,9 @@ def collect_episode(
         "low_max_after_mean": float(np.mean(env.history["low_max_after"])),
         "oob_sum": float(np.sum(env.history["low_oob_count"])),
         "path_length_sum": path_length,
+        "energy_used_sum": float(energy_used),
+        "energy_charged_sum": float(energy_charged),
+        "min_battery": float(np.asarray(env.history["battery"], np.float32).min()),
     }
 
 
@@ -183,6 +191,12 @@ def save_eval_episode(env: AttentionChargingEnv, path: Path, metric: dict[str, f
         "upper_reward_waiting": np.asarray(env.history["reward_waiting"], np.float32),
         "upper_reward_buffer": np.asarray(env.history["reward_buffer"], np.float32),
         "upper_reward_death": np.asarray(env.history["reward_death"], np.float32),
+        "energy_block_per_uav": np.asarray(env.history["energy_block"], np.float32),
+        "energy_outbound_per_uav": np.asarray(env.history["energy_outbound"], np.float32),
+        "energy_return_per_uav": np.asarray(env.history["energy_return"], np.float32),
+        "energy_charge_added_per_uav": np.asarray(
+            env.history["energy_charge_added"], np.float32
+        ),
         "low_block_reward": np.asarray(env.history["low_reward"], np.float32),
         "low_max_before": np.asarray(env.history["low_max_before"], np.float32),
         "low_max_after": np.asarray(env.history["low_max_after"], np.float32),
@@ -361,10 +375,10 @@ def save_eval_plots(
 @torch.no_grad()
 def evaluate(
     env_cfg: dict, cfg: dict, agent: AttentionSACAgent, mappo: MAPPO, episodes: int,
-    *, training_upper_step: int, out_dir: Path,
+    *, training_episode: int, training_upper_step: int, out_dir: Path,
 ) -> dict[str, float]:
     metrics = []
-    eval_dir = out_dir / "evaluations" / f"step_{training_upper_step:07d}"
+    eval_dir = out_dir / "evaluations" / f"episode_{training_episode:04d}"
     eval_dir.mkdir(parents=True, exist_ok=True)
     for ep in range(episodes):
         ecfg = copy.deepcopy(env_cfg)
@@ -381,10 +395,14 @@ def evaluate(
             f"  [eval episode {ep}] return={m['return']:.3f} avg_buf={m['buf']:.3f} "
             f"sum serving count over time: {int(m['serving_sum'])} "
             f"dead={int(m['dead_count'])} oob={int(m['oob_sum'])} "
-            f"path={m['path_length_sum']:.1f}"
+            f"path={m['path_length_sum']:.1f} min_batt={m['min_battery']:.3f} "
+            f"energy_use={m['energy_used_sum']:.3f} charge_in={m['energy_charged_sum']:.3f}"
         )
 
-    summary: dict[str, float] = {"training_upper_step": float(training_upper_step)}
+    summary: dict[str, float] = {
+        "training_episode": float(training_episode),
+        "training_upper_step": float(training_upper_step),
+    }
     for key in metrics[0]:
         values = np.asarray([x[key] for x in metrics], dtype=np.float64)
         summary[f"{key}_mean"] = float(values.mean())
@@ -395,6 +413,45 @@ def evaluate(
         **{key: np.asarray([x[key] for x in metrics], np.float32) for key in metrics[0]},
     )
     return summary
+
+
+def summarize_episode_window(
+    episodes: list[dict[str, float]], start_episode: int, end_episode: int,
+) -> dict[str, float]:
+    summary: dict[str, float] = {
+        "episode_start": float(start_episode), "episode_end": float(end_episode)
+    }
+    for key in episodes[0]:
+        values = np.asarray([x[key] for x in episodes], np.float64)
+        summary[f"{key}_mean"] = float(values.mean())
+        summary[f"{key}_sum"] = float(values.sum())
+    return summary
+
+
+def save_training_low_max_so_far(
+    episode_metrics: list[dict[str, float]], out_dir: Path,
+) -> None:
+    y = np.asarray([x["low_max_after"] for x in episode_metrics], np.float32)
+    x = np.arange(1, len(y) + 1)
+    fig, ax = plt.subplots(figsize=(10, 5), dpi=150)
+    ax.plot(x, y, color="tab:blue", alpha=0.30, linewidth=0.8,
+            label="Episode mean low max_after")
+    if len(y) >= 50:
+        rolling = np.convolve(y, np.ones(50, np.float32) / 50.0, mode="valid")
+        ax.plot(np.arange(50, len(y) + 1), rolling, color="tab:red", linewidth=2.0,
+                label="50-episode moving average")
+    ax.set(
+        title="Training Low-level System Max Buffer So Far",
+        xlabel="Training episode", ylabel="Mean max buffer after collection",
+    )
+    ax.grid(True, alpha=0.25); ax.legend(loc="best")
+    fig.tight_layout()
+    fig.savefig(out_dir / "training_low_max_buffer_so_far.png", bbox_inches="tight")
+    plt.close(fig)
+    np.savez_compressed(
+        out_dir / "training_low_max_buffer_so_far.npz",
+        episode=x.astype(np.int32), low_max_after_mean=y,
+    )
 
 
 def save_checkpoint(
@@ -412,8 +469,12 @@ def save_checkpoint(
 class TrainingRolloutCollector:
     """Collect an exact number of upper steps while carrying partial episodes across PPO updates."""
 
-    def __init__(self, env: AttentionChargingEnv, mappo: MAPPO) -> None:
+    def __init__(
+        self, env: AttentionChargingEnv, mappo: MAPPO,
+        low_update_hook=None,
+    ) -> None:
         self.env, self.mappo = env, mappo
+        self.low_update_hook = low_update_hook
         self.obs: dict[str, np.ndarray] | None = None
         self.rollout: EpisodeRollout | None = None
         self.completed_episodes = 0
@@ -424,6 +485,8 @@ class TrainingRolloutCollector:
         self.obs = self.env.reset(reset_dyn_rng=False)
         self.rollout = EpisodeRollout()
         self.ep_return = 0.0
+        if self.low_update_hook is not None and hasattr(self.low_update_hook, "start_episode"):
+            self.low_update_hook.start_episode()
 
     def collect(
         self, target_steps: int, max_completed_episodes: int | None = None
@@ -444,7 +507,8 @@ class TrainingRolloutCollector:
                 self.obs["actor_obs"], self.obs["critic_obs"], deterministic=False
             )
             next_obs, reward, done, _ = self.env.step(
-                action, deterministic_low=False, collect_low_replay=True
+                action, deterministic_low=False, collect_low_replay=True,
+                low_update_hook=self.low_update_hook,
             )
             self.rollout.add(
                 self.obs["actor_obs"], self.obs["critic_obs"], action, logp,
@@ -459,12 +523,46 @@ class TrainingRolloutCollector:
                     last_value=0.0, gamma=self.mappo.cfg.gamma,
                     gae_lambda=self.mappo.cfg.gae_lambda,
                 ))
+                status = np.asarray(self.env.history["status"], np.int8)[1:]
+                low_max_before = np.asarray(self.env.history["low_max_before"], np.float32)
+                low_max_after = np.asarray(self.env.history["low_max_after"], np.float32)
+                low_team = np.asarray(self.env.history["low_team_max_sum"], np.float32)
+                low_oob = np.asarray(self.env.history["low_oob_count"], np.float32)
+                low_covered = np.asarray(self.env.history["low_covered_count"], np.float32)
+                energy_used = sum(
+                    np.asarray(self.env.history[key], np.float32).sum()
+                    for key in ("energy_block", "energy_outbound", "energy_return")
+                )
+                energy_charged = np.asarray(
+                    self.env.history["energy_charge_added"], np.float32
+                ).sum()
+                sac_ep = (
+                    self.low_update_hook.finish_episode()
+                    if self.low_update_hook is not None
+                    and hasattr(self.low_update_hook, "finish_episode")
+                    else {}
+                )
                 completed_metrics.append({
                     "return": float(self.ep_return),
                     "buf": float(np.mean(self.env.history["buf_metric"])),
+                    "buf_max": float(np.max(self.env.history["buf_metric"])),
                     "serving": float(np.mean(self.env.history["serving_count"])),
                     "serving_sum": float(np.sum(self.env.history["serving_count"])),
                     "dead": float(np.any(np.asarray(self.env.history["status"])[-1] == 3)),
+                    "upper_steps": float(len(self.env.history["buf_metric"])),
+                    "waiting": float(np.mean((status == 1).sum(axis=1))),
+                    "charging": float(np.mean((status == 2).sum(axis=1))),
+                    "low_steps": float(len(low_max_after)),
+                    "low_reward": float(np.mean(self.env.low_env.hist_reward)),
+                    "low_max_before": float(low_max_before.mean()),
+                    "low_max_after": float(low_max_after.mean()),
+                    "low_team_max_sum": float(low_team.mean()),
+                    "low_oob_sum": float(low_oob.sum()),
+                    "low_covered": float(low_covered.mean()),
+                    "energy_used": float(energy_used),
+                    "energy_charged": float(energy_charged),
+                    "min_battery": float(np.asarray(self.env.history["battery"]).min()),
+                    **sac_ep,
                 })
                 self.completed_episodes += 1
                 self.obs, self.rollout = None, None
@@ -479,6 +577,52 @@ class TrainingRolloutCollector:
         return chunks, completed_metrics, steps
 
 
+class OnlineSACTrainer:
+    """Match standalone SAC: update immediately after eligible low transitions."""
+
+    def __init__(
+        self, env: AttentionChargingEnv, agent: AttentionSACAgent,
+        replay: BalancedVariableReplayBuffer, cfg: dict, device: str,
+    ) -> None:
+        self.env, self.agent, self.replay = env, agent, replay
+        self.cfg, self.device = cfg, device
+        self.losses = []
+        self.episode_losses = []
+
+    def reset_rollout_stats(self) -> None:
+        self.losses.clear()
+
+    def start_episode(self) -> None:
+        self.episode_losses.clear()
+
+    def finish_episode(self) -> dict[str, float]:
+        if not self.episode_losses:
+            return {"sac_updates": 0.0, "sac_actor_loss": 0.0, "sac_critic_loss": 0.0}
+        return {
+            "sac_updates": float(len(self.episode_losses)),
+            "sac_actor_loss": float(np.mean([x.actor_loss for x in self.episode_losses])),
+            "sac_critic_loss": float(np.mean([x.critic_loss for x in self.episode_losses])),
+        }
+
+    def __call__(self) -> None:
+        tr, sac = self.cfg["training"], self.cfg["sac"]
+        start = max(1, int(tr["sac_update_start_size"]))
+        every = max(1, int(tr["sac_update_every_low_steps"]))
+        if len(self.replay) < start or self.env.low_replay_steps % every != 0:
+            return
+        for _ in range(int(tr["sac_updates_per_low_step"])):
+            # The configured warm-up normally leaves at least 5,000 samples;
+            # min() also keeps smoke/custom configurations well-defined.
+            batch_size = min(int(sac["batch_size"]), len(self.replay))
+            batch = self.replay.sample(
+                batch_size, self.device,
+                float(tr["replay_balanced_fraction"]),
+            )
+            loss = self.agent.update(batch)
+            self.losses.append(loss)
+            self.episode_losses.append(loss)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=Path, default=ROOT / "configs" / "joint.yaml")
@@ -491,9 +635,9 @@ def main() -> None:
     if args.smoke:
         cfg["training"].update(
             num_episodes=1, rollout_steps=2, mappo_warmup_upper_steps=2,
-            eval_interval_upper_steps=1, eval_start_upper_steps=1, eval_episodes=1,
-            checkpoint_interval_upper_steps=1, sac_update_start_size=10_000,
-            sac_updates_per_rollout=1,
+            report_interval_episodes=1, eval_episodes=1,
+            checkpoint_interval_upper_steps=1, sac_update_start_size=1,
+            sac_update_every_low_steps=1, sac_updates_per_low_step=1,
         )
         cfg["joint"]["episode_len_steps"] = 2
         env_cfg["time"]["high_steps"] = 2
@@ -503,15 +647,16 @@ def main() -> None:
     out_dir = ROOT / tr["output_dir"]
     out_dir.mkdir(parents=True, exist_ok=True)
     logs: list[dict[str, float]] = []
+    episode_metrics: list[dict[str, float]] = []
+    reports: list[dict[str, float]] = []
     best_return = -np.inf
-    collector = TrainingRolloutCollector(env, mappo)
+    online_sac = OnlineSACTrainer(env, agent, replay, cfg, args.device)
+    collector = TrainingRolloutCollector(env, mappo, low_update_hook=online_sac)
     total_episodes = int(tr["num_episodes"])
-    target_upper_steps = total_episodes * int(cfg["joint"]["episode_len_steps"])
     rollout_steps = int(tr["rollout_steps"])
     update_idx = 0
-    next_eval = max(
-        rollout_steps, int(tr.get("eval_start_upper_steps", rollout_steps))
-    )
+    report_interval = int(tr["report_interval_episodes"])
+    next_report_episode = report_interval
     next_checkpoint = int(tr["checkpoint_interval_upper_steps"])
     train_start_time = time.perf_counter()
 
@@ -519,11 +664,15 @@ def main() -> None:
         update_start_time = time.perf_counter()
         update_idx += 1
         rollout_start_upper_step = collector.total_upper_steps
-        # MAPPO and SAC are both frozen for this entire on-policy rollout.
+        online_sac.reset_rollout_stats()
+        # MAPPO stays frozen for this rollout. SAC trains online after each
+        # eligible low transition, matching the standalone attention-SAC loop.
         chunks, train_metrics, collected_steps = collector.collect(
             rollout_steps, total_episodes
         )
-        progress = collector.total_upper_steps / max(1, target_upper_steps)
+        # Training ends by completed episodes, so schedules must not assume
+        # every episode reaches the nominal 100-step horizon.
+        progress = collector.completed_episodes / max(1, total_episodes)
         # Warm-up is step based, so episode length and death cannot change it.
         if rollout_start_upper_step >= int(tr["mappo_warmup_upper_steps"]):
             ppo_info = mappo.update(chunks, progress=progress)
@@ -534,32 +683,61 @@ def main() -> None:
                 "samples": float(collected_steps), "early_stop": 0.0,
             }
 
-        sac_losses = []
-        if len(replay) >= int(tr["sac_update_start_size"]):
-            for _ in range(int(tr["sac_updates_per_rollout"])):
-                batch = replay.sample(
-                    int(cfg["sac"]["batch_size"]), args.device,
-                    float(tr["replay_balanced_fraction"]),
-                )
-                sac_losses.append(agent.update(batch))
+        sac_losses = online_sac.losses
+        episode_metrics.extend(train_metrics)
 
-        # At most one evaluation per changed policy; intervals are upper-step based.
+        # Reporting/evaluation is based on completed charging episodes. Every
+        # report summarizes exactly the preceding 50 training episodes.
         eval_payload: dict[str, float] = {}
-        if collector.total_upper_steps >= next_eval:
-            eval_label = collector.total_upper_steps
+        while next_report_episode <= len(episode_metrics):
+            start_episode = next_report_episode - report_interval + 1
+            window = episode_metrics[start_episode - 1:next_report_episode]
+            report = summarize_episode_window(window, start_episode, next_report_episode)
             ev = evaluate(
                 env_cfg, cfg, agent, mappo, int(tr["eval_episodes"]),
-                training_upper_step=eval_label, out_dir=out_dir,
+                training_episode=next_report_episode,
+                training_upper_step=collector.total_upper_steps, out_dir=out_dir,
             )
             eval_payload.update({f"eval_{k}": v for k, v in ev.items()})
+            report.update({f"eval_{k}": v for k, v in ev.items()})
+            report.update({f"ppo_{k}": v for k, v in ppo_info.items()})
+            now_report = time.perf_counter()
+            elapsed_report = now_report - train_start_time
+            remaining = max(0, total_episodes - next_report_episode)
+            eta_report = elapsed_report / next_report_episode * remaining
+            report.update(elapsed_seconds=float(elapsed_report), eta_seconds=float(eta_report))
+            reports.append(report)
+            save_training_low_max_so_far(
+                episode_metrics[:next_report_episode], out_dir
+            )
+            print(
+                f"[episodes {start_episode:04d}-{next_report_episode:04d}] "
+                f"upper_R={report['return_mean']:.3f} "
+                f"upper_buf={report['buf_mean']:.2f} "
+                f"serve={report['serving_mean']:.2f} "
+                f"wait={report['waiting_mean']:.2f} charge={report['charging_mean']:.2f} "
+                f"dead_rate={report['dead_mean']:.2f} len={report['upper_steps_mean']:.1f} | "
+                f"low_R={report['low_reward_mean']:.3f} "
+                f"low_max_before={report['low_max_before_mean']:.2f} "
+                f"low_max_after={report['low_max_after_mean']:.2f} "
+                f"team_max_sum={report['low_team_max_sum_mean']:.2f} "
+                f"oob={report['low_oob_sum_sum']:.0f} "
+                f"sac_upd={report['sac_updates_sum']:.0f} "
+                f"energy_use={report['energy_used_mean']:.3f} "
+                f"charge_in={report['energy_charged_mean']:.3f} "
+                f"min_batt={report['min_battery_mean']:.3f} "
+                f"elapsed={format_duration(elapsed_report)} eta={format_duration(eta_report)}"
+            )
             if ev["return_mean"] > best_return and ev["dead_mean"] == 0.0:
                 best_return = ev["return_mean"]
                 save_checkpoint(
                     out_dir / "best.pt", collector.completed_episodes,
                     collector.total_upper_steps, agent, mappo, cfg,
                 )
-            interval = int(tr["eval_interval_upper_steps"])
-            next_eval = (collector.total_upper_steps // interval + 1) * interval
+            next_report_episode += report_interval
+        (out_dir / "episode_reports.json").write_text(
+            json.dumps(reports, indent=2), encoding="utf-8"
+        )
 
         row = {
             "update": float(update_idx),
@@ -569,7 +747,8 @@ def main() -> None:
             "train_return": float(np.mean([m["return"] for m in train_metrics])) if train_metrics else 0.0,
             "train_buf": float(np.mean([m["buf"] for m in train_metrics])) if train_metrics else 0.0,
             "train_serving": float(np.mean([m["serving"] for m in train_metrics])) if train_metrics else 0.0,
-            "replay_size": float(len(replay)), **{f"ppo_{k}": v for k, v in ppo_info.items()},
+            "replay_size": float(len(replay)), "sac_updates": float(len(sac_losses)),
+            **{f"ppo_{k}": v for k, v in ppo_info.items()},
             **eval_payload,
         }
         if sac_losses:
@@ -587,15 +766,6 @@ def main() -> None:
         eta_seconds = (
             elapsed_seconds / collector.completed_episodes * remaining_episodes
             if collector.completed_episodes > 0 else 0.0
-        )
-        print(
-            f"[update {update_idx:04d} | ep {collector.completed_episodes:04d}/{total_episodes} "
-            f"| upper_step {collector.total_upper_steps:07d}] "
-            f"R={row['train_return']:.3f} buf={row['train_buf']:.2f} "
-            f"serve={row['train_serving']:.2f} replay={len(replay)} "
-            f"kl={row['ppo_kl']:.4f} alpha={agent.alpha.detach().item():.3f} "
-            f"time={format_duration(update_seconds)} "
-            f"elapsed={format_duration(elapsed_seconds)} eta={format_duration(eta_seconds)}"
         )
         (out_dir / "metrics.json").write_text(json.dumps(logs, indent=2), encoding="utf-8")
         if collector.total_upper_steps >= next_checkpoint:
